@@ -1,0 +1,72 @@
+# ============================================================
+# whitelist.yaml — 白名单：只有以下域名 / IP 才走代理，其余默认直连。
+#
+# YAML 列表格式：每行一个条目，- 开头，支持 # 注释、空行忽略。
+#   - example.com      域名（精确匹配，并包含其所有子域 www.example.com）
+#   - .example.com     域名（只匹配子域，不匹配根域）
+#   - 10.0.0.0/24     IP 网段（CIDR 形式，支持 0.0.0.0/0 表示全部 IP）
+#
+# 说明：
+#   - 白名单为空则所有流量直连（等价于关闭代理）
+# ============================================================
+
+# ── GitHub 全家桶 ─────────────────────────────────────────
+# 主站 + 资源CDN + 原始文件/Release + 容器仓库
+- github.com
+- githubusercontent.com
+- githubassets.com
+- ghcr.io
+
+# ── Google 全家桶 ─────────────────────────────────────────
+# 搜索 / Gmail / Drive / Docs / 翻译 / 地图 + 字体/API/静态资源 + YouTube
+- google.com
+- google.com.hk
+- googleusercontent.com
+- googleapis.com
+- gstatic.com
+- googletagmanager.com
+- google-analytics.com
+- gmail.com
+- youtube.com
+- youtu.be
+- ytimg.com
+- googlevideo.com
+- goo.gl
+
+# ── 推特 / X ──────────────────────────────────────────────
+# 主站 + 图片/视频 CDN + 短链接
+- twitter.com
+- x.com
+- twimg.com
+- t.co
+
+# ── 技术社区 ──────────────────────────────────────────────
+- stackoverflow.com
+- stackexchange.com
+- developer.mozilla.org
+- medium.com
+- dev.to
+- news.ycombinator.com
+- wikipedia.org
+- reddit.com
+
+# ── 代码托管 / 包管理 / 开发工具 ──────────────────────────
+- gitlab.com
+- bitbucket.org
+- npmjs.com
+- registry.npmjs.org
+- pypi.org
+- files.pythonhosted.org
+- docker.com
+- docker.io
+- golang.org
+- go.dev
+- pkg.go.dev
+- crates.io
+- static.crates.io
+- nodejs.org
+- python.org
+- rust-lang.org
+- jetbrains.com
+- code.visualstudio.com
+- visualstudio.com
