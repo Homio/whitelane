@@ -1,0 +1,17 @@
+# logrotate 配置：proxy-auth 认证日志轮转
+# 部署位置: /etc/logrotate.d/whitelane-auth
+# 说明:
+#   - su: 日志目录属于 wanghaomiao 且组可写，旋转时切换到该用户避免
+#         "parent directory has insecure permissions" 报错
+#   - copytruncate: 进程以追加方式持有 fd，轮转时先拷贝再清空，无需重启进程
+#   - delaycompress: 昨天那份先不压缩，避免与仍在写入的 fd 冲突
+/home/wanghaomiao/software/gost/proxy-auth.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su wanghaomiao wanghaomiao
+}

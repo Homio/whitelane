@@ -156,7 +156,7 @@ do_knock() {
 
     echo "🔑 敲门认证 ${host}:${AUTH_PORT} ..." >&2
     local result
-    result=$(curl -s --connect-timeout 5 "$auth_url" 2>&1) || true
+    result=$(curl -s --connect-timeout 5 --max-time 10 "$auth_url" 2>&1) || true
 
     if echo "$result" | grep -qi "Success\|already authorized\|localhost"; then
         echo "✅ ${result}" >&2

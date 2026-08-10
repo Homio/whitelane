@@ -18,6 +18,10 @@ import logging
 import os
 import sys
 import signal
+import socket
+import threading
+import time
+import urllib.request
 
 # ── Configuration ──────────────────────────────────────────────
 SECRET_TOKEN = "homio-666-open-the-door"
@@ -179,6 +183,40 @@ def list_authorized_ips():
 # ── HTTP handler ───────────────────────────────────────────────
 
 class AuthHandler(http.server.BaseHTTPRequestHandler):
+    # 单请求读超时（秒）：防止慢速/半开连接让 readline 永久阻塞。
+    # 超时后 handle_one_request 会捕获 socket.timeout 并关闭连接，
+    # 配合多线程服务器（见 AuthServer），单条坏连接不再拖死整个认证服务。
+    timeout = 10
+    # 整条连接的总处理预算（秒）：即使攻击者每隔几秒喂一字节绕过
+    # 上面的读超时，到点也会被守护线程强制关闭，线程不会无限占用。
+    REQUEST_BUDGET = 20
+
+    def handle(self):
+        # 守护超时：到点强制关闭连接，任何阻塞中的 read/write 立刻失败，
+        # 对应线程随即退出——slowloris 慢速攻击也拖不死线程。
+        guard = threading.Timer(self.REQUEST_BUDGET, self._force_close)
+        guard.daemon = True
+        guard.start()
+        try:
+            super().handle()
+        finally:
+            guard.cancel()
+
+    def _force_close(self):
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.connection.close()
+        except OSError:
+            pass
+
+    def handle_error(self, request, client_address):
+        # 连接被守护超时强关 / 客户端中途断开时，只记一行警告，
+        # 不打印吓人的 traceback 刷爆日志。
+        logger.warning("Handler error for %s: %r", client_address[0], sys.exc_info()[1])
+
     def do_GET(self):
         expected_auth = f"/auth?token={SECRET_TOKEN}"
 
@@ -200,6 +238,12 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
             body = f"Active IPs ({len(ips)}):\n" + "\n".join(f"  - {ip}" for ip in ips) + "\n"
             self.wfile.write(body.encode())
 
+        elif self.path == "/healthz":
+            # 供内置健康检查线程探测；任何时刻都应毫秒级返回
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok\n")
+
         else:
             logger.warning("Bad knock from %s (path=%s)", self.client_address[0], self.path)
             self.send_response(403)
@@ -208,6 +252,76 @@ class AuthHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         logger.info("%s - %s", self.client_address[0], fmt % args)
+
+
+# ── Server ────────────────────────────────────────────────────
+# 多线程 + 端口复用 + 更大的排队深度。
+# 原实现是单线程 socketserver.TCPServer：任何一条"连上但不发完整请求"
+# 的连接都会让主线程永久阻塞在 readline()，此后所有敲门都只握手不应答
+# （内核 backlog 完成 SYN-ACK，应用层却不再 accept），表现为：
+#    curl 能连上 :8799 但收不到任何 HTTP 响应 → whitelan 报"认证失败:（空）"。
+class AuthServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    request_queue_size = 64
+    daemon_threads = True
+    # 并发处理上限：超过的连接立即丢弃，防止攻击者用海量连接
+    # 占满线程/内存（资源型 DoS）。合法敲门一次一条，32 绰绰有余。
+    MAX_CONCURRENT = 32
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._sem = threading.BoundedSemaphore(self.MAX_CONCURRENT)
+
+    def process_request_thread(self, request, client_address):
+        # 信号量在整个 handler 生命周期内持有，真正限制并发线程数。
+        if not self._sem.acquire(blocking=False):
+            logger.warning(
+                "Concurrency cap hit (%d), dropping %s",
+                self.MAX_CONCURRENT, client_address[0],
+            )
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._sem.release()
+
+
+# ── 自愈健康检查 ─────────────────────────────────────────────
+HEALTH_INTERVAL = 30      # 每 30s 自测一次
+HEALTH_TIMEOUT  = 5       # 单次自测超时
+HEALTH_FAIL_LIMIT = 3     # 连续失败 3 次（约 95s）判定卡死
+
+def _health_check():
+    """后台线程：周期性探测本机 :8799/healthz。
+
+    正常时毫秒级返回。若进程真的卡死（accept 循环失效 / 线程耗尽等），
+    探测会超时；连续多次失败即主动退出，让 systemd 秒级拉起——
+    再也不会出现"进程活着但已聋"而无人发现的情况。
+    """
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    failures = 0
+    while True:
+        time.sleep(HEALTH_INTERVAL)
+        try:
+            with opener.open(
+                f"http://127.0.0.1:{AUTH_PORT}/healthz", timeout=HEALTH_TIMEOUT
+            ) as resp:
+                if resp.status == 200:
+                    failures = 0
+                    continue
+                failures += 1
+        except Exception:
+            failures += 1
+        logger.warning(
+            "Health check failed (%d/%d consecutive)", failures, HEALTH_FAIL_LIMIT,
+        )
+        if failures >= HEALTH_FAIL_LIMIT:
+            logger.error(
+                "Health check failed %d times in a row – auth server wedged, "
+                "exiting so systemd can restart it.", HEALTH_FAIL_LIMIT,
+            )
+            os._exit(1)
 
 
 # ── Main ───────────────────────────────────────────────────────
@@ -223,7 +337,10 @@ def main():
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
-    with socketserver.TCPServer(("", AUTH_PORT), AuthHandler) as httpd:
+    # 自愈：卡死则主动退出，交给 systemd 拉起
+    threading.Thread(target=_health_check, daemon=True).start()
+
+    with AuthServer(("", AUTH_PORT), AuthHandler) as httpd:
         logger.info("Auth watchdog listening on 0.0.0.0:%d (TTL=%ds) …", AUTH_PORT, SESSION_TTL)
         httpd.serve_forever()
 
