@@ -156,13 +156,25 @@ do_knock() {
 
     echo "🔑 敲门认证 ${host}:${AUTH_PORT} ..." >&2
     local result
-    result=$(curl -s --connect-timeout 5 --max-time 10 "$auth_url" 2>&1) || true
+    # 敲门必须直连：--noproxy '*' 绕过代理环境变量。
+    # 否则 shell 里残留的 http_proxy（尤其指向已停止的本地路由代理）
+    # 会让 curl 走死代理，敲门静默失败且输出为空。
+    result=$(curl -s --noproxy '*' --connect-timeout 5 --max-time 10 "$auth_url" 2>&1) || true
 
     if echo "$result" | grep -qi "Success\|already authorized\|localhost"; then
         echo "✅ ${result}" >&2
         return 0
     else
         echo "❌ 认证失败: ${result}" >&2
+        if [ -z "$result" ]; then
+            local err
+            err=$(curl --noproxy '*' -o /dev/null -sS --connect-timeout 5 "$auth_url" 2>&1 | head -1)
+            echo "   详细: ${err:-curl 无输出（可能超时或被防火墙丢弃）}" >&2
+            if [ -n "${http_proxy:-}${HTTP_PROXY:-}${all_proxy:-}${ALL_PROXY:-}" ]; then
+                echo "   提示: 当前 shell 设置了代理变量（http_proxy=${http_proxy:-}），敲门已强制直连；" >&2
+                echo "         若其它命令异常，请先 unset http_proxy https_proxy all_proxy" >&2
+            fi
+        fi
         return 1
     fi
 }
@@ -194,10 +206,12 @@ start_route_proxy() {
     echo $! > "$ROUTE_PID"
 
     # 等待端口就绪
+    # 注意：探测必须全部在子 shell 内完成。早期写法在父 shell 里
+    # 执行 exec 3>&- 3<&- 2>/dev/null，exec 无命令时重定向会永久
+    # 作用于当前 shell，导致后续所有 stderr 提示静默丢失。
     local i
     for i in $(seq 1 25); do
         if (exec 3<>"/dev/tcp/127.0.0.1/$LOCAL_PROXY_PORT") 2>/dev/null; then
-            exec 3>&- 3<&- 2>/dev/null || true
             return 0
         fi
         sleep 0.2
@@ -299,7 +313,7 @@ proxy_on() {
         else
             proxy_endpoint="http://${host}:${PROXY_PORT}"
         fi
-        HTTP_CODE=$(curl -x "$proxy_endpoint" \
+        HTTP_CODE=$(curl -x "$proxy_endpoint" --noproxy '*' \
             -s -o /dev/null -w "%{http_code}" --connect-timeout 3 "$test_url" 2>/dev/null || echo "超时")
         if [ "$HTTP_CODE" = "超时" ] || [ -z "$HTTP_CODE" ]; then
             echo "⚠️  警告: 代理链路不可达（${proxy_endpoint} → $test_url）" >&2
