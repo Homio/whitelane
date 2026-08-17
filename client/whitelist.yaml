@@ -32,6 +32,8 @@
 - ytimg.com
 - googlevideo.com
 - goo.gl
+- dns.google
+- gemini.google.com
 
 # ── 推特 / X ──────────────────────────────────────────────
 # 主站 + 图片/视频 CDN + 短链接
@@ -71,3 +73,20 @@
 - jetbrains.com
 - code.visualstudio.com
 - visualstudio.com
+
+# ── 网络 / 商业技术站 ──────────────────────────
+- mozilla.cloudflare-dns.com
+
+# ── 微软全家桶 ────────────────────────────────────────────
+# Windows Update 下载 / 更新传输 / CDN / 网络检测
+- microsoft.com            # 主域，含 update/download/support 等所有子域
+- windowsupdate.com        # 更新下载核心（download.windowsupdate.com、catalog.s.download.windowsupdate.com）
+- mp.microsoft.com         # 更新传输（delivery.mp.microsoft.com）
+- windows.com              # Windows 相关
+- aka.ms                   # 微软短链接（vc_redist 等安装包入口）
+- windows.net              # Azure 存储（blob.core.windows.net 等）
+- azureedge.net            # Azure CDN
+- akamaiedge.net           # Akamai CDN（微软下载的实际边缘节点）
+- trafficmanager.net       # Azure 流量调度
+- msftconnecttest.com      # 网络连通性检测
+- msftncsi.com             # NCSI 连通检测

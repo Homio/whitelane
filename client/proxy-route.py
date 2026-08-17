@@ -108,7 +108,21 @@ def relay_loop(src, dst):
 
 
 def upstream_connect(host, port, timeout=15):
-    return socket.create_connection((host, port), timeout=timeout)
+    # 仅 IPv4：先解析出 IPv4 地址再连接。create_connection 直接传域名时
+    # 会按系统顺序解析（IPv6 优先），本机公网 IPv6 无连通性，SYN 会卡满
+    # timeout 才回退，导致每个直连请求都挂起
+    infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+    last_err = None
+    for info in infos:
+        sock = socket.socket(*info[:3])
+        sock.settimeout(timeout)
+        try:
+            sock.connect(info[4])
+            return sock
+        except OSError as e:
+            last_err = e
+            sock.close()
+    raise last_err if last_err else OSError("no IPv4 address: %s" % host)
 
 
 def handle_connect(client, hostport, rest, router):
