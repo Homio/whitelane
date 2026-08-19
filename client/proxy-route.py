@@ -4,8 +4,11 @@
 proxy-route.py — 本地白名单路由代理
 ====================================
 默认直连：白名单内的域名 / IP 走远程代理，其余流量本地直连（低延迟）。
-支持 HTTP 与 HTTPS（CONNECT 隧道）。所有 CLI 工具（curl/wget/git/python/npm）
-只需把 http_proxy/https_proxy 指向本代理，即可获得统一的"默认直连 + 白名单走代理"。
+支持 HTTP 与 HTTPS（CONNECT 隧道），并兼容 SOCKS5（无认证 + CONNECT 命令）：
+按首字节嗅探协议（0x05 → SOCKS5，其余 → HTTP），两条协议分支复用同一套
+白名单分流逻辑。所有 CLI 工具（curl/wget/git/python/npm）只需把
+http_proxy/https_proxy（或 all_proxy=socks5h://）指向本代理，即可获得统一的
+"默认直连 + 白名单走代理"。
 
 用法:
   proxy-route.py <config.json>
@@ -125,6 +128,73 @@ def upstream_connect(host, port, timeout=15):
     raise last_err if last_err else OSError("no IPv4 address: %s" % host)
 
 
+def _read_exact(conn, n):
+    """读满 n 字节，对端提前关闭则抛 OSError"""
+    buf = b""
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            raise OSError("连接被对端提前关闭")
+        buf += chunk
+    return buf
+
+
+def _socks5_reply(client, rep):
+    # VER=5 REP=rep RSV=0 ATYP=1(IPv4) BND.ADDR=0.0.0.0 BND.PORT=0
+    client.sendall(b"\x05" + bytes([rep]) + b"\x00\x01\x00\x00\x00\x00\x00\x00")
+
+
+def _open_tunnel(host, port, router):
+    """按白名单分流建立到 host:port 的隧道，返回已就绪的 upstream socket。
+    白名单内 → 经远程代理 CONNECT；否则 → 目标直连。失败抛 OSError。"""
+    if router.is_whitelisted(host):
+        upstream = upstream_connect(router.proxy_host, router.proxy_port)
+        req = ("CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n" % (host, port, host, port)).encode()
+        upstream.sendall(req)
+        _, rstr, _ = read_head(upstream)
+        if " 200 " not in rstr.split("\r\n", 1)[0]:
+            upstream.close()
+            raise OSError("远程代理拒绝 CONNECT %s:%d" % (host, port))
+        return upstream
+    return upstream_connect(host, port)
+
+
+def handle_socks5(client, router):
+    """SOCKS5 握手（仅无认证 + CONNECT 命令），隧道建立后与 HTTP 分支同一套分流/转发"""
+    client.settimeout(30)                        # 握手阶段限时，防挂死连接占线程
+    ver, nmethods = _read_exact(client, 2)
+    if ver != 0x05:
+        return
+    _read_exact(client, nmethods)                # 客户端认证方式列表（忽略，固定无认证）
+    client.sendall(b"\x05\x00")                  # 选择 NO AUTHENTICATION
+    ver, cmd, _rsv, atyp = _read_exact(client, 4)
+    if ver != 0x05:
+        return
+    if cmd != 0x01:                              # 只支持 CONNECT，拒绝 BIND/UDP ASSOCIATE
+        _socks5_reply(client, 0x07)
+        return
+    if atyp == 0x01:                             # IPv4
+        host = socket.inet_ntoa(_read_exact(client, 4))
+    elif atyp == 0x03:                           # 域名
+        (ln,) = _read_exact(client, 1)
+        host = _read_exact(client, ln).decode("utf-8", "replace")
+    elif atyp == 0x04:                           # IPv6
+        host = socket.inet_ntop(socket.AF_INET6, _read_exact(client, 16))
+    else:
+        _socks5_reply(client, 0x08)              # address type not supported
+        return
+    port = int.from_bytes(_read_exact(client, 2), "big")
+    try:
+        upstream = _open_tunnel(host, port, router)
+    except OSError as e:
+        LOG.warning("SOCKS5 CONNECT %s:%d 失败: %s", host, port, e)
+        _socks5_reply(client, 0x05)              # connection refused
+        return
+    _socks5_reply(client, 0x00)                  # succeeded
+    client.settimeout(None)                      # 进入转发阶段，恢复阻塞模式
+    _relay_pair(client, upstream)
+
+
 def handle_connect(client, hostport, rest, router):
     """HTTPS 隧道：白名单→远程代理 CONNECT；否则→目标直连"""
     if ":" not in hostport:
@@ -133,17 +203,7 @@ def handle_connect(client, hostport, rest, router):
     host, _, port_s = hostport.rpartition(":")
     port = int(port_s) if port_s.isdigit() else 443
     try:
-        if router.is_whitelisted(host):
-            upstream = upstream_connect(router.proxy_host, router.proxy_port)
-            req = ("CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n" % (host, port, host, port)).encode()
-            upstream.sendall(req)
-            rhead, rstr, _ = read_head(upstream)
-            if " 200 " not in rstr.split("\r\n", 1)[0]:
-                client.sendall(rhead if rhead else b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                upstream.close()
-                return
-        else:
-            upstream = upstream_connect(host, port)
+        upstream = _open_tunnel(host, port, router)
         client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
     except OSError as e:
         LOG.warning("CONNECT %s 失败: %s", hostport, e)
@@ -225,6 +285,10 @@ class ClientHandler:
 
     def run(self):
         try:
+            first = self.client.recv(1, socket.MSG_PEEK)   # 协议嗅探：0x05 → SOCKS5
+            if first == b"\x05":
+                handle_socks5(self.client, self.router)
+                return
             head_bytes, head_str, rest = read_head(self.client)
             if not head_str:
                 return
