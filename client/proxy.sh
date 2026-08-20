@@ -105,7 +105,12 @@ gsettings_manual_matches() {
 }
 
 route_proxy_is_running() {
-    [ -f "$ROUTE_PID" ] && kill -0 "$(cat "$ROUTE_PID")" 2>/dev/null
+    # PID 文件有效则直接判定；文件丢失/过时则按命令行探测真实进程
+    # （否则会出现：进程明明活着，status 却显示"未运行"）
+    if [ -f "$ROUTE_PID" ] && kill -0 "$(cat "$ROUTE_PID")" 2>/dev/null; then
+        return 0
+    fi
+    pgrep -f "$SCRIPT_DIR/proxy-route.py" >/dev/null 2>&1
 }
 
 # 按当前 CLI_MODE 判断系统代理是否处于对应的开启状态：
@@ -202,6 +207,16 @@ start_route_proxy() {
         return 0
     fi
 
+    # PID 文件丢失/过时但进程可能还活着：直接启动新进程会 bind 失败秒退，
+    # 死 PID 被写入文件、端口探测又因旧进程存活而误判"启动成功"（假重启）。
+    # 此时优先修正 PID 文件，复用现有进程，不中断已建立的连接。
+    local real_pid
+    real_pid="$(pgrep -f "$SCRIPT_DIR/proxy-route.py" | head -1)"
+    if [ -n "$real_pid" ]; then
+        echo "$real_pid" > "$ROUTE_PID"
+        return 0
+    fi
+
     nohup python3 "$SCRIPT_DIR/proxy-route.py" "$ROUTE_CONF" >> "$ROUTE_LOG" 2>&1 &
     echo $! > "$ROUTE_PID"
 
@@ -228,6 +243,12 @@ stop_route_proxy() {
             kill "$pid" 2>/dev/null || true
         fi
         rm -f "$ROUTE_PID"
+    fi
+    # 兜底：PID 文件丢失/过时时上面的逻辑杀不到真进程，
+    # 按启动命令行匹配清理残留，确保 off 后端口真正释放
+    if pgrep -f "$SCRIPT_DIR/proxy-route.py" >/dev/null 2>&1; then
+        pkill -f "$SCRIPT_DIR/proxy-route.py" 2>/dev/null || true
+        sleep 0.3
     fi
 }
 
