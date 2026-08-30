@@ -26,6 +26,7 @@ import logging
 import socket
 import sys
 import threading
+import time
 
 LOG = logging.getLogger("proxy-route")
 
@@ -95,12 +96,14 @@ def parse_head(head_str):
 
 
 def relay_loop(src, dst):
+    total = 0
     try:
         while True:
             data = src.recv(65536)
             if not data:
                 break
             dst.sendall(data)
+            total += len(data)
     except OSError:
         pass
     finally:
@@ -108,6 +111,7 @@ def relay_loop(src, dst):
             dst.shutdown(socket.SHUT_WR)
         except OSError:
             pass
+    return total
 
 
 def upstream_connect(host, port, timeout=15):
@@ -121,6 +125,9 @@ def upstream_connect(host, port, timeout=15):
         sock.settimeout(timeout)
         try:
             sock.connect(info[4])
+            # 注意：带 timeout 返回——它覆盖"TCP 连接 + 调用方的代理握手"阶段
+            # （对 GOST 半挂死兜底）。调用方必须在进入数据转发（_relay_pair）前
+            # settimeout(None)，否则空闲长连接（WebSocket 等）会被误杀。
             return sock
         except OSError as e:
             last_err = e
@@ -147,16 +154,31 @@ def _socks5_reply(client, rep):
 def _open_tunnel(host, port, router):
     """按白名单分流建立到 host:port 的隧道，返回已就绪的 upstream socket。
     白名单内 → 经远程代理 CONNECT；否则 → 目标直连。失败抛 OSError。"""
+    t0 = time.time()
+    target = "%s:%d" % (host, port)
     if router.is_whitelisted(host):
-        upstream = upstream_connect(router.proxy_host, router.proxy_port)
-        req = ("CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n" % (host, port, host, port)).encode()
-        upstream.sendall(req)
-        _, rstr, _ = read_head(upstream)
-        if " 200 " not in rstr.split("\r\n", 1)[0]:
-            upstream.close()
-            raise OSError("远程代理拒绝 CONNECT %s:%d" % (host, port))
+        try:
+            upstream = upstream_connect(router.proxy_host, router.proxy_port)
+            req = ("CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n" % (host, port, host, port)).encode()
+            upstream.sendall(req)
+            _, rstr, _ = read_head(upstream)
+            if " 200 " not in rstr.split("\r\n", 1)[0]:
+                upstream.close()
+                raise OSError("远程代理拒绝 CONNECT %s:%d" % (host, port))
+        except OSError as e:
+            LOG.warning("OPEN  %-45s GOST   FAIL %.2fs %s", target, time.time() - t0, e)
+            raise
+        LOG.info("OPEN  %-45s GOST   OK   %.2fs", target, time.time() - t0)
+        upstream.settimeout(None)   # CONNECT 握手已收到回应，超时兜底到此为止；转发阶段必须无超时
         return upstream
-    return upstream_connect(host, port)
+    try:
+        upstream = upstream_connect(host, port)
+    except OSError as e:
+        LOG.warning("OPEN  %-45s DIRECT FAIL %.2fs %s", target, time.time() - t0, e)
+        raise
+    LOG.info("OPEN  %-45s DIRECT OK   %.2fs", target, time.time() - t0)
+    upstream.settimeout(None)       # 直连无握手阶段，返回即转发：禁用超时
+    return upstream
 
 
 def handle_socks5(client, router):
@@ -186,13 +208,12 @@ def handle_socks5(client, router):
     port = int.from_bytes(_read_exact(client, 2), "big")
     try:
         upstream = _open_tunnel(host, port, router)
-    except OSError as e:
-        LOG.warning("SOCKS5 CONNECT %s:%d 失败: %s", host, port, e)
+    except OSError:
         _socks5_reply(client, 0x05)              # connection refused
         return
     _socks5_reply(client, 0x00)                  # succeeded
     client.settimeout(None)                      # 进入转发阶段，恢复阻塞模式
-    _relay_pair(client, upstream)
+    _relay_pair(client, upstream, "S5 %s:%d" % (host, port))
 
 
 def handle_connect(client, hostport, rest, router):
@@ -205,8 +226,7 @@ def handle_connect(client, hostport, rest, router):
     try:
         upstream = _open_tunnel(host, port, router)
         client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-    except OSError as e:
-        LOG.warning("CONNECT %s 失败: %s", hostport, e)
+    except OSError:
         try:
             client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
         except OSError:
@@ -217,7 +237,7 @@ def handle_connect(client, hostport, rest, router):
             upstream.sendall(rest)
         except OSError:
             pass
-    _relay_pair(client, upstream)
+    _relay_pair(client, upstream, hostport)
 
 
 def handle_http(client, request_line, headers, rest, router, head_bytes):
@@ -239,9 +259,11 @@ def handle_http(client, request_line, headers, rest, router, head_bytes):
     try:
         if router.is_whitelisted(hostname):
             upstream = upstream_connect(router.proxy_host, router.proxy_port)
+            LOG.info("OPEN  %-45s GOST   OK   (http %s)", hostname, method)
             out_head = head_bytes                     # 代理可接受原样
         else:
             upstream = upstream_connect(hostname, port)
+            LOG.info("OPEN  %-45s DIRECT OK   (http %s)", hostname, method)
             # 直连需 origin-form 请求行
             path = target
             if target.startswith("http://") or target.startswith("https://"):
@@ -266,16 +288,48 @@ def handle_http(client, request_line, headers, rest, router, head_bytes):
     except OSError:
         upstream.close()
         return
-    _relay_pair(client, upstream)
+    upstream.settimeout(None)       # 请求头已发出（sendall 阶段有 timeout 兜底），转发前禁用超时
+    _relay_pair(client, upstream, "HTTP %s %s" % (method, hostname))
 
 
-def _relay_pair(a, b):
-    t1 = threading.Thread(target=relay_loop, args=(a, b), daemon=True)
-    t2 = threading.Thread(target=relay_loop, args=(b, a), daemon=True)
+def _enable_keepalive(sock):
+    """转发阶段开启 TCP keepalive：探测由内核自动完成，对端正常时内核回 ACK，
+    不影响应用层空闲长连接（WebSocket 挂多久都不受影响）。
+    仅用于检出对端半开（断电/断网无 FIN/RST）造成的 relay 线程永久挂死：
+    空闲 60s 后开始探测，每 10s 一次，3 次无 ACK 判死（合计约 90s），
+    recv 抛 OSError → relay_loop 退出 → 线程回收。"""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        idle = getattr(socket, "TCP_KEEPIDLE", None)
+        intvl = getattr(socket, "TCP_KEEPINTVL", None)
+        cnt = getattr(socket, "TCP_KEEPCNT", None)
+        if idle is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, idle, 60)
+        if intvl is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, intvl, 10)
+        if cnt is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, cnt, 3)
+    except OSError:
+        pass                          # keepalive 设置失败不影响转发
+
+
+def _relay_pair(a, b, meta=None):
+    t0 = time.time()
+    sent = [0]
+    _enable_keepalive(a)              # 两侧都开：任一侧半开连接 ~90s 内回收线程
+    _enable_keepalive(b)
+
+    def _loop(src, dst):
+        sent[0] += relay_loop(src, dst)
+
+    t1 = threading.Thread(target=_loop, args=(a, b), daemon=True)
+    t2 = threading.Thread(target=_loop, args=(b, a), daemon=True)
     t1.start()
     t2.start()
     t1.join()
     t2.join()
+    if meta:
+        LOG.info("CLOSE %-45s dur=%6.0fs bytes=%d", meta, time.time() - t0, sent[0])
 
 
 class ClientHandler:
