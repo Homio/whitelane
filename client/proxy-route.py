@@ -36,6 +36,8 @@ class Router:
         self.proxy_host = conf["proxy_host"]
         self.proxy_port = int(conf["proxy_port"])
         self.whitelist = [str(x).strip() for x in conf.get("whitelist", [])]
+        # 局域网暴露（listen_host=0.0.0.0）时的来源过滤；127.0.0.1 恒允许（本机 route 模式不受影响）
+        self.allow_cidrs = [str(x).strip() for x in conf.get("allow_cidrs", ["127.0.0.1/32"])]
         self.shutdown_flag = False
 
     def is_whitelisted(self, host):
@@ -68,6 +70,12 @@ class Router:
             return ipaddress.ip_address(host) in ipaddress.ip_network(cidr, strict=False)
         except ValueError:
             return False
+
+    def allowed_peer(self, ip):
+        """accept 后的来源过滤：白名单外来源直接断开，不进入协议处理"""
+        if ip == "127.0.0.1":
+            return True
+        return any(self._in_cidr(ip, c) for c in self.allow_cidrs if c)
 
 # ================= 连接处理 =================
 def read_head(client):
@@ -365,21 +373,29 @@ class ClientHandler:
                 pass
 
 
-def serve(router, port):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+def serve(router, port, host="127.0.0.1"):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)   # AF_INET + IPv4 字面量绑定：绝不监听 IPv6
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", port))
+    srv.bind((host, port))
     srv.listen(128)
     srv.settimeout(0.5)
-    LOG.info("本地白名单路由代理已启动 127.0.0.1:%d → 远程代理 %s:%d（默认直连）",
-             port, router.proxy_host, router.proxy_port)
+    LOG.info("本地白名单路由代理已启动 %s:%d → 远程代理 %s:%d（默认直连，allow_cidrs=%s）",
+             host, port, router.proxy_host, router.proxy_port, router.allow_cidrs)
     while not router.shutdown_flag:
         try:
-            conn, _ = srv.accept()
+            conn, addr = srv.accept()
         except socket.timeout:
             continue
         except OSError:
             break
+        peer = addr[0] if isinstance(addr, tuple) else str(addr)
+        if not router.allowed_peer(peer):
+            LOG.warning("REJECT 来源 %-15s 不在 allow_cidrs", peer)
+            try:
+                conn.close()
+            except OSError:
+                pass
+            continue
         threading.Thread(target=ClientHandler(conn, router).run, daemon=True).start()
     srv.close()
     LOG.info("代理已退出")
@@ -392,10 +408,11 @@ def main():
     with open(sys.argv[1]) as f:
         conf = json.load(f)
     port = int(conf.get("listen_port", 18080))
+    host = str(conf.get("listen_host", "127.0.0.1"))
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     router = Router(conf)
     try:
-        serve(router, port)
+        serve(router, port, host)
     except KeyboardInterrupt:
         router.shutdown_flag = True
 

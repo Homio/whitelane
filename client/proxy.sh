@@ -190,8 +190,15 @@ start_route_proxy() {
 
     # 生成 JSON 配置（供 python 路由代理读取）
     {
-        printf '{"listen_port": %s, "proxy_host": "%s", "proxy_port": %s, "whitelist": [' \
-            "$LOCAL_PROXY_PORT" "$host" "$PROXY_PORT"
+        printf '{"listen_host": "%s", "listen_port": %s, "proxy_host": "%s", "proxy_port": %s, "allow_cidrs": [' \
+            "${LOCAL_LISTEN_HOST:-127.0.0.1}" "$LOCAL_PROXY_PORT" "$host" "$PROXY_PORT"
+        local first=1 c
+        for c in ${ALLOW_CIDRS:-}; do
+            [ "$first" = "1" ] || printf ','
+            first=0
+            printf '"%s"' "$(printf '%s' "$c" | sed 's/"/\\"/g')"
+        done
+        printf '], "whitelist": ['
         local first=1 e
         for e in "${WHITELIST[@]:-}"; do
             [ -z "$e" ] && continue
