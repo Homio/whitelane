@@ -76,6 +76,8 @@
 
 # ── 网络 / 商业技术站 ──────────────────────────
 - mozilla.cloudflare-dns.com
+- cdn-zcode.z.ai
+- zcode.z.ai
 
 # ── 微软全家桶 ────────────────────────────────────────────
 # Windows Update 下载 / 更新传输 / CDN / 网络检测
@@ -90,3 +92,6 @@
 - trafficmanager.net       # Azure 流量调度
 - msftconnecttest.com      # 网络连通性检测
 - msftncsi.com             # NCSI 连通检测
+
+# ── 网络 / 天气 ──────────────────────────
+- windy.com
