@@ -36,19 +36,41 @@ whitelane/
 
 ### 客户端
 
+在项目根目录执行，无需 sudo 或软链接，仅支持 Bash：
+
 ```bash
-# 1. 编辑 proxy.conf 填入代理服务器信息，编辑 whitelist.yaml 填入白名单
-# 2. 开启（会先敲门认证，再配置系统代理并输出命令行环境变量）
+bash client/proxy.sh install
+source ~/.bashrc
+
 whitelane on
-
-# 3. 在 ~/.bashrc 里放一个函数，让子 shell 也能拿到代理变量：
-whitelane() {
-    eval "$(/path/to/whitelane/client/proxy.sh "$@")"
-}
-
-# 4. 关闭
+whitelane status
 whitelane off
 ```
+
+安装会复制客户端，并自动向 `~/.bashrc` 添加加载入口；SSH 与桌面终端的用法相同，无需手写 `eval` 或函数。安装不会自动开启代理，环境变量只影响执行 `whitelane on/off` 的当前 Shell 及其之后启动的子进程。
+
+| 安装内容 | 默认位置 |
+|----------|----------|
+| 命令 | `~/.local/bin/whitelane`（普通文件，不是软链接） |
+| 路由引擎 | `~/.local/share/whitelane/proxy-route.py` |
+| 配置与白名单 | `~/.config/whitelane/proxy.conf`、`~/.config/whitelane/whitelist.yaml` |
+
+首次安装从 `client/` 复制配置与白名单，之后请编辑安装目录中的配置；重复安装不会覆盖已有配置。数据与配置目录分别遵循 `XDG_DATA_HOME`、`XDG_CONFIG_HOME`，运行时仍可用 `PROXY_CONF`、`PROXY_WHITELIST` 指定其他配置文件。
+
+更新和卸载同样在项目根目录执行，安装后的 `whitelane` 命令不提供这三个管理子命令：
+
+```bash
+bash client/proxy.sh sync
+source ~/.bashrc
+
+whitelane off
+bash client/proxy.sh uninstall
+unset -f whitelane
+```
+
+`sync` 只更新主脚本和路由引擎，保留配置、白名单与 Bash 配置；已运行的路由进程需要手动 `whitelane off` / `whitelane on` 才会加载新代码。`uninstall` 默认保留配置与白名单，加 `--purge` 才删除它们；卸载不会自动停止代理，因此需要时先执行 `whitelane off`。
+
+如果之前创建过 `/usr/local/bin/whitelane` 软链接，请确认其指向本项目后删除，并移除手写的旧 `whitelane()` 函数，再使用上述安装方式。
 
 `whitelane` 的命令行有三种模式（`proxy.conf` 里 `CLI_MODE` 指定）：
 

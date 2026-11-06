@@ -31,18 +31,151 @@
 #   $(basename "$0") [status]    查看当前代理状态
 #
 # 说明:
-#   on/off 时将环境变量语句输出到 stdout（供 bashrc 函数 eval 使用），
+#   on/off 时将环境变量语句输出到 stdout（供 Shell 函数加载），
 #   人类可读提示信息输出到 stderr。
 # ============================================================
 
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    _WHITELANE_SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
+    case ":$PATH:" in
+        *":$HOME/.local/bin:"*) ;;
+        *) export PATH="$HOME/.local/bin:$PATH" ;;
+    esac
+
+    whitelane() {
+        local proxy_commands
+        case "${1:-status}" in
+            on|off)
+                proxy_commands="$(command "$_WHITELANE_SCRIPT" "$@")" || return $?
+                source /dev/stdin <<< "$proxy_commands"
+                ;;
+            *)
+                command "$_WHITELANE_SCRIPT" "$@"
+                ;;
+        esac
+    }
+    return 0
+fi
+
 set -euo pipefail
 
-# ── 自身定位（支持软链接）──────────────────────────────────
 SELF_NAME="$(basename "$0")"
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+SCRIPT_FILE="$(readlink -f "$0")"
+SCRIPT_DIR="$(dirname "$SCRIPT_FILE")"
+INSTALL_BIN="$HOME/.local/bin/whitelane"
+INSTALL_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/whitelane"
+INSTALL_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/whitelane"
+
+update_bashrc() {
+    python3 - "$1" <<'PY'
+import os
+from pathlib import Path
+import sys
+
+path = Path.home() / '.bashrc'
+hook = 'if [ -f "$HOME/.local/bin/whitelane" ]; then source "$HOME/.local/bin/whitelane"; fi\n'
+exists = path.exists()
+if not exists and sys.argv[1] == 'uninstall':
+    sys.exit(0)
+text = path.read_text() if exists else ''
+lines = [line for line in text.splitlines(keepends=True) if line.rstrip('\r\n') != hook.rstrip('\n')]
+updated = ''.join(lines)
+if sys.argv[1] == 'install':
+    if updated and not updated.endswith('\n'):
+        updated += '\n'
+    updated += hook
+if updated != text:
+    path.write_text(updated)
+    if not exists:
+        os.chmod(path, 0o600)
+PY
+}
+
+copy_client() {
+    if [[ ! -f "$SCRIPT_DIR/proxy-route.py" ]]; then
+        printf '缺少客户端文件: %s\n' "$SCRIPT_DIR/proxy-route.py" >&2
+        return 1
+    fi
+    mkdir -p "$(dirname "$INSTALL_BIN")" "$INSTALL_DATA"
+    install -T -m 755 "$SCRIPT_DIR/proxy-route.py" "$INSTALL_DATA/proxy-route.py"
+    install -T -m 755 "$SCRIPT_FILE" "$INSTALL_BIN"
+}
+
+case "${1:-}" in
+    install|uninstall|sync)
+        if [[ "$SCRIPT_FILE" -ef "$INSTALL_BIN" ]]; then
+            printf '请在源码目录执行: bash client/proxy.sh %s\n' "$1" >&2
+            exit 1
+        fi
+        for directory in "$INSTALL_DATA" "$INSTALL_CONF"; do
+            if [[ -L "$directory" || ( -e "$directory" && ! -d "$directory" ) ]]; then
+                printf '安装目录必须是普通目录，不能是软链接: %s\n' "$directory" >&2
+                exit 1
+            fi
+        done
+        if [[ -d "$INSTALL_BIN" ]]; then
+            printf '命令安装位置不能是目录: %s\n' "$INSTALL_BIN" >&2
+            exit 1
+        fi
+        if [[ $# -gt 1 ]] && ! [[ "$1" == uninstall && $# -eq 2 && "$2" == --purge ]]; then
+            printf '用法: bash client/proxy.sh install | sync | uninstall [--purge]\n' >&2
+            exit 1
+        fi
+        case "$1" in
+            install)
+                command -v python3 >/dev/null || { printf '安装需要 python3\n' >&2; exit 1; }
+                for name in proxy.conf whitelist.yaml; do
+                    if [[ ! -f "$INSTALL_CONF/$name" && ! -f "$SCRIPT_DIR/$name" ]]; then
+                        printf '缺少配置文件: %s\n' "$SCRIPT_DIR/$name" >&2
+                        exit 1
+                    fi
+                done
+                copy_client
+                mkdir -p "$INSTALL_CONF"
+                for name in proxy.conf whitelist.yaml; do
+                    if [[ ! -e "$INSTALL_CONF/$name" ]]; then
+                        install -T -m 600 "$SCRIPT_DIR/$name" "$INSTALL_CONF/$name"
+                    fi
+                done
+                update_bashrc install
+                printf '已安装: %s\n配置目录: %s（已有配置不覆盖）\n' "$INSTALL_BIN" "$INSTALL_CONF"
+                printf '请执行 source ~/.bashrc，或重新登录；然后使用 whitelane on/off/status。\n'
+                ;;
+            sync)
+                if [[ ! -f "$INSTALL_BIN" || -L "$INSTALL_BIN" ]]; then
+                    printf '尚未安装，请先执行: bash client/proxy.sh install\n' >&2
+                    exit 1
+                fi
+                copy_client
+                printf '已同步客户端代码，配置和白名单保持不变。\n'
+                printf '请执行 source ~/.bashrc，或重新登录，以加载最新的 Shell 函数。\n'
+                ;;
+            uninstall)
+                command -v python3 >/dev/null || { printf '卸载需要 python3\n' >&2; exit 1; }
+                update_bashrc uninstall
+                rm -f -- "$INSTALL_BIN" "$INSTALL_DATA/proxy-route.py"
+                if [[ "${2:-}" == --purge ]]; then
+                    rm -f -- "$INSTALL_CONF/proxy.conf" "$INSTALL_CONF/whitelist.yaml"
+                else
+                    printf '配置和白名单已保留: %s\n' "$INSTALL_CONF"
+                fi
+                printf '已卸载。当前终端请执行: unset -f whitelane\n'
+                printf '卸载不会关闭正在运行的代理；如需关闭，请在卸载前执行 whitelane off。\n'
+                ;;
+        esac
+        exit 0
+        ;;
+esac
+
+CONF_DIR="$SCRIPT_DIR"
+ROUTE_SCRIPT="$SCRIPT_DIR/proxy-route.py"
+if [[ "$SCRIPT_FILE" -ef "$INSTALL_BIN" ]]; then
+    CONF_DIR="$INSTALL_CONF"
+    ROUTE_SCRIPT="$INSTALL_DATA/proxy-route.py"
+fi
 
 # ── 配置文件 ───────────────────────────────────────────────
-CONF_FILE="${PROXY_CONF:-$SCRIPT_DIR/proxy.conf}"
+CONF_FILE="${PROXY_CONF:-$CONF_DIR/proxy.conf}"
 if [ ! -f "$CONF_FILE" ]; then
     echo "❌ 找不到配置文件: ${CONF_FILE}" >&2
     echo "   请先创建配置文件（模板见 proxy.conf），或用环境变量 PROXY_CONF 指定路径" >&2
@@ -54,7 +187,7 @@ source "$CONF_FILE"
 # ── 白名单 ─────────────────────────────────────────────────
 # 从 whitelist.yaml 加载（YAML 列表：- 开头 + 每行一个条目，# 为注释）。
 # 支持 域名 / .子域 / IP / CIDR 四种格式（详见 whitelist.yaml 头部说明）。
-WHITELIST_FILE="${PROXY_WHITELIST:-$SCRIPT_DIR/whitelist.yaml}"
+WHITELIST_FILE="${PROXY_WHITELIST:-$CONF_DIR/whitelist.yaml}"
 WHITELIST=()
 if [ -f "$WHITELIST_FILE" ]; then
     while IFS= read -r w || [ -n "$w" ]; do
@@ -110,7 +243,7 @@ route_proxy_is_running() {
     if [ -f "$ROUTE_PID" ] && kill -0 "$(cat "$ROUTE_PID")" 2>/dev/null; then
         return 0
     fi
-    pgrep -f "$SCRIPT_DIR/proxy-route.py" >/dev/null 2>&1
+    pgrep -f "$ROUTE_SCRIPT" >/dev/null 2>&1
 }
 
 # 按当前 CLI_MODE 判断系统代理是否处于对应的开启状态：
@@ -187,6 +320,7 @@ do_knock() {
 # ── 本地路由代理（route 模式）─────────────────────────────
 start_route_proxy() {
     local host="${1:-$PROXY_HOST}"
+    mkdir -p "$CACHE_DIR"
 
     # 生成 JSON 配置（供 python 路由代理读取）
     {
@@ -218,13 +352,13 @@ start_route_proxy() {
     # 死 PID 被写入文件、端口探测又因旧进程存活而误判"启动成功"（假重启）。
     # 此时优先修正 PID 文件，复用现有进程，不中断已建立的连接。
     local real_pid
-    real_pid="$(pgrep -f "$SCRIPT_DIR/proxy-route.py" | head -1)"
+    real_pid="$(pgrep -f "$ROUTE_SCRIPT" | head -1)"
     if [ -n "$real_pid" ]; then
         echo "$real_pid" > "$ROUTE_PID"
         return 0
     fi
 
-    nohup python3 "$SCRIPT_DIR/proxy-route.py" "$ROUTE_CONF" >> "$ROUTE_LOG" 2>&1 &
+    nohup python3 "$ROUTE_SCRIPT" "$ROUTE_CONF" >> "$ROUTE_LOG" 2>&1 &
     echo $! > "$ROUTE_PID"
 
     # 等待端口就绪
@@ -253,8 +387,8 @@ stop_route_proxy() {
     fi
     # 兜底：PID 文件丢失/过时时上面的逻辑杀不到真进程，
     # 按启动命令行匹配清理残留，确保 off 后端口真正释放
-    if pgrep -f "$SCRIPT_DIR/proxy-route.py" >/dev/null 2>&1; then
-        pkill -f "$SCRIPT_DIR/proxy-route.py" 2>/dev/null || true
+    if pgrep -f "$ROUTE_SCRIPT" >/dev/null 2>&1; then
+        pkill -f "$ROUTE_SCRIPT" 2>/dev/null || true
         sleep 0.3
     fi
 }
@@ -263,12 +397,11 @@ stop_route_proxy() {
 proxy_on() {
     local host="${1:-$PROXY_HOST}"
 
-    # 已是开启状态则跳过，不重复设置
-    # （direct 模式不导出 CLI 代理变量，只看系统代理是否已开启）
-    if system_proxy_is_on "$host"; then
+    # direct 模式每个 Shell 都需要生成 proxyrun，不能仅凭系统状态跳过。
+    if [ "$CLI_MODE" != "direct" ] && system_proxy_is_on "$host"; then
         if [ "$CLI_MODE" = "route" ] && ! route_proxy_is_running; then
             : # 路由代理未运行，继续重新配置
-        elif [ "$CLI_MODE" = "direct" ] || env_proxy_is_on "$host"; then
+        elif env_proxy_is_on "$host"; then
             echo "✅ 代理已处于开启状态（${host}:${PROXY_PORT}），无需重复设置" >&2
             return 0
         fi
@@ -419,6 +552,8 @@ EOF
 proxy_off() {
     # 已是关闭状态则跳过，不重复操作
     if system_proxy_is_off && env_proxy_is_off; then
+        printf '%s\n' 'unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY no_proxy NO_PROXY'
+        printf '%s\n' 'unset -f proxyrun 2>/dev/null || true'
         echo "✅ 代理已处于关闭状态，无需重复操作" >&2
         return 0
     fi
@@ -513,6 +648,12 @@ usage() {
     echo "   status  查看当前代理状态（无参数时默认为 status）"
     echo ""
     echo "配置: ${CONF_FILE}"
+    if [[ ! "$SCRIPT_FILE" -ef "$INSTALL_BIN" ]]; then
+        printf '\n源码管理:\n'
+        printf '   bash client/proxy.sh install              安装并配置 Bash\n'
+        printf '   bash client/proxy.sh sync                 更新代码，保留配置\n'
+        printf '   bash client/proxy.sh uninstall [--purge]  卸载，默认保留配置\n'
+    fi
 }
 
 # ── 入口 ──────────────────────────────────────────────────
@@ -525,6 +666,9 @@ case "${1:-}" in
         ;;
     "" | status)
         proxy_status
+        ;;
+    help|-h|--help)
+        usage
         ;;
     *)
         usage
